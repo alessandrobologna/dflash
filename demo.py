@@ -134,7 +134,7 @@ class TerminalUI:
         table = self.table_cls(show_header=True, box=None, padding=(0, 2))
         table.add_column("path", style="dim")
         table.add_column("tokens", justify="right")
-        table.add_column("time", justify="right")
+        table.add_column("decode", justify="right")
         table.add_column("tok/s", justify="right")
         table.add_column("peak", justify="right")
         for stats in [target, dflash]:
@@ -150,12 +150,18 @@ class TerminalUI:
         self.out.print(table)
 
         if target is not None and dflash is not None:
-            speedup = dflash.measured_tps / max(target.measured_tps, 1e-9)
-            speed_style = "green" if speedup >= 1.0 else "red"
             self.out.print("speedup   ", end="", style="dim")
-            self.out.print(f"{speedup:.2f}x", style=speed_style)
+            if exact_match:
+                speedup = target.elapsed_s / max(dflash.elapsed_s, 1e-9)
+                speed_style = "green" if speedup >= 1.0 else "red"
+                self.out.print(f"{speedup:.2f}x", style=speed_style)
+            else:
+                self.out.print("n/a", style="red")
             self.out.print("same text ", end="", style="dim")
             self.out.print("yes" if exact_match else "no", style="green" if exact_match else "red")
+            if not exact_match:
+                self.out.print("note      ", end="", style="dim")
+                self.out.print("outputs differ, so speedup is not comparable", style="dim")
 
         if dflash is not None and dflash.acceptance_lengths:
             accepted = dflash.acceptance_lengths
@@ -377,15 +383,26 @@ def _run_target(
     last_tps = 0.0
     peak_memory = 0.0
 
-    runtime.mx.synchronize()
-    start = time.perf_counter()
-    for response in runtime.stream_generate_baseline(
-        model,
-        tokenizer,
-        prompt,
-        max_tokens,
-        sampler=sampler,
-    ):
+    iterator = iter(
+        runtime.stream_generate_baseline(
+            model,
+            tokenizer,
+            prompt,
+            max_tokens,
+            sampler=sampler,
+        )
+    )
+    elapsed = 0.0
+    while True:
+        runtime.mx.synchronize()
+        step_start = time.perf_counter()
+        try:
+            response = next(iterator)
+        except StopIteration:
+            break
+        runtime.mx.synchronize()
+        elapsed += time.perf_counter() - step_start
+
         segment = getattr(response, "text", "")
         if stream and segment:
             if not printer.write(segment):
@@ -400,8 +417,6 @@ def _run_target(
         peak_memory = max(peak_memory, float(getattr(response, "peak_memory", 0.0) or 0.0))
         if not stream and _strip_stop_text("".join(text_parts)) != "".join(text_parts):
             break
-    runtime.mx.synchronize()
-    elapsed = time.perf_counter() - start
 
     if stream:
         printer.close()
@@ -442,17 +457,28 @@ def _run_dflash(
     peak_memory = 0.0
     acceptance_lengths: list[int] = []
 
-    runtime.mx.synchronize()
-    start = time.perf_counter()
-    for response in runtime.stream_generate(
-        model,
-        draft,
-        tokenizer,
-        prompt,
-        block_size=block_size,
-        max_tokens=max_tokens,
-        sampler=sampler,
-    ):
+    iterator = iter(
+        runtime.stream_generate(
+            model,
+            draft,
+            tokenizer,
+            prompt,
+            block_size=block_size,
+            max_tokens=max_tokens,
+            sampler=sampler,
+        )
+    )
+    elapsed = 0.0
+    while True:
+        runtime.mx.synchronize()
+        step_start = time.perf_counter()
+        try:
+            response = next(iterator)
+        except StopIteration:
+            break
+        runtime.mx.synchronize()
+        elapsed += time.perf_counter() - step_start
+
         segment = response.text
         if stream and segment:
             if not printer.write(segment):
@@ -473,8 +499,6 @@ def _run_dflash(
         peak_memory = max(peak_memory, float(response.peak_memory))
         if not stream and _strip_stop_text("".join(text_parts)) != "".join(text_parts):
             break
-    runtime.mx.synchronize()
-    elapsed = time.perf_counter() - start
 
     if stream:
         printer.close()
@@ -532,15 +556,20 @@ def _print_plain_stats(target: RunStats | None, dflash: RunStats | None, *, bloc
         print(
             f"{stats.name:11} "
             f"tokens={stats.tokens:4d} "
-            f"time={stats.elapsed_s:7.3f}s "
+            f"decode={stats.elapsed_s:7.3f}s "
             f"tps={stats.measured_tps:7.2f} "
             f"peak={stats.peak_memory_gb:5.2f} GB"
         )
 
     if target is not None and dflash is not None:
-        speedup = dflash.measured_tps / max(target.measured_tps, 1e-9)
-        print(f"speedup     {speedup:7.2f}x")
+        if exact_match:
+            speedup = target.elapsed_s / max(dflash.elapsed_s, 1e-9)
+            print(f"speedup     {speedup:7.2f}x")
+        else:
+            print("speedup         n/a")
         print(f"same text   {'yes' if exact_match else 'no'}")
+        if not exact_match:
+            print("note        outputs differ, so speedup is not comparable")
 
     if dflash is not None and dflash.acceptance_lengths:
         accepted = dflash.acceptance_lengths
