@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -20,10 +21,8 @@ from loguru import logger
 from rich import print
 from tqdm import tqdm
 
-random.seed(42)
-
-
 CACHE_DIR = Path(__file__).parent.parent / "cache"
+DEFAULT_SAMPLE_SEED = 42
 
 DATASETS = {
     "gsm8k": {
@@ -93,11 +92,12 @@ def load_and_process_dataset(data_name: str) -> list[dict]:
         return [json.loads(line) for line in f]
 
 
-def _limit_dataset(dataset: list[dict], max_samples: int | None) -> list[dict]:
+def _limit_dataset(dataset: list[dict], max_samples: int | None, seed: int) -> list[dict]:
     if max_samples is None or len(dataset) <= max_samples:
-        return dataset
-    random.shuffle(dataset)
-    return dataset[:max_samples]
+        return list(dataset)
+    selected = list(dataset)
+    random.Random(seed).shuffle(selected)
+    return selected[:max_samples]
 
 
 def _apply_chat_template(tokenizer, messages: list[dict], enable_thinking: bool) -> str:
@@ -109,12 +109,62 @@ def _apply_chat_template(tokenizer, messages: list[dict], enable_thinking: bool)
     )
 
 
-def _make_decode_metrics(num_output_tokens: int, generation_tps: float, acceptance_lengths: list[int]) -> SimpleNamespace:
+def _make_decode_metrics(
+    num_output_tokens: int,
+    generation_tps: float,
+    acceptance_lengths: list[int],
+    profile: dict[str, float] | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         num_output_tokens=num_output_tokens,
         time_per_output_token=1.0 / generation_tps if generation_tps > 0 else float("inf"),
         acceptance_lengths=acceptance_lengths,
+        profile=profile,
     )
+
+
+def _sum_profiles(profiles: list[dict[str, float]]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    for profile in profiles:
+        for key, value in profile.items():
+            totals[key] = totals.get(key, 0.0) + value
+    return totals
+
+
+def _print_profile_summary(responses: list[dict[int, SimpleNamespace]], block_size: int) -> None:
+    baseline_profiles = [r[1].profile for r in responses if r[1].profile]
+    if baseline_profiles:
+        baseline_totals = _sum_profiles(baseline_profiles)
+        baseline_tokens = sum(r[1].num_output_tokens for r in responses)
+        baseline_s = baseline_totals.get("baseline_s", 0.0)
+        print("\nBaseline profile totals:")
+        print(f"  baseline_s: {baseline_s:.3f}s ({baseline_s / max(baseline_tokens, 1) * 1000:.2f} ms/output tok)")
+        print(f"  emitted tokens: {baseline_tokens}")
+
+    profiles = [r[block_size].profile for r in responses if r[block_size].profile]
+    if not profiles:
+        return
+
+    totals = _sum_profiles(profiles)
+    num_tokens = sum(r[block_size].num_output_tokens for r in responses)
+    num_steps = max(int(totals.get("steps", len(profiles))), 1)
+    print("\nDFlash profile totals:")
+    for key in [
+        "prefill_s",
+        "cache_checkpoint_s",
+        "draft_s",
+        "verify_s",
+        "cache_trim_s",
+        "cache_replay_s",
+    ]:
+        value = totals.get(key, 0.0)
+        print(f"  {key}: {value:.3f}s ({value / max(num_tokens, 1) * 1000:.2f} ms/output tok)")
+    print(f"  profile steps: {num_steps}")
+    print(f"  emitted tokens: {num_tokens}")
+    print(f"  avg accepted/profile step: {totals.get('accepted', 0.0) / num_steps:.2f}")
+    print(f"  avg block size/profile step: {totals.get('block_size', 0.0) / num_steps:.2f}")
+    print(f"  target cache trimmable: {bool(round(totals.get('target_cache_trimmable', 0.0) / num_steps))}")
+    print(f"  block verify: {bool(round(totals.get('block_verify', 0.0) / num_steps))}")
 
 
 def _print_decode_summary(responses: list[dict[int, SimpleNamespace]], block_size: int) -> None:
@@ -130,6 +180,22 @@ def _print_decode_summary(responses: list[dict[int, SimpleNamespace]], block_siz
     acceptance_lengths = list(chain.from_iterable(r[block_size].acceptance_lengths for r in responses))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+    _print_profile_summary(responses, block_size)
+
+
+def _first_mismatch(left: list[int], right: list[int]) -> int | None:
+    for idx, (a, b) in enumerate(zip(left, right)):
+        if a != b:
+            return idx
+    if len(left) != len(right):
+        return min(len(left), len(right))
+    return None
+
+
+def _token_window(tokens: list[int], center: int, radius: int = 6) -> list[int]:
+    start = max(center - radius, 0)
+    end = min(center + radius + 1, len(tokens))
+    return tokens[start:end]
 
 
 def _env_int(name: str, default: int) -> int:
@@ -327,10 +393,14 @@ def _send_vllm(
 
 
 def _run_mlx(args: argparse.Namespace) -> None:
+    import mlx.core as mx
     from mlx_lm import stream_generate as stream_generate_baseline
     from mlx_lm.sample_utils import make_sampler
 
-    from .model_mlx import load, load_draft, stream_generate
+    from .model_mlx_clean import load, load_draft, stream_generate
+
+    if args.check_equivalence and args.temperature != 0.0:
+        raise ValueError("--check-equivalence requires greedy decoding with --temperature 0.0")
 
     sampler = make_sampler(temp=args.temperature)
 
@@ -341,40 +411,102 @@ def _run_mlx(args: argparse.Namespace) -> None:
     block_size = args.block_size if args.block_size is not None else int(draft.config.block_size)
 
     dataset = load_and_process_dataset(args.dataset)
-    dataset = _limit_dataset(dataset, args.max_samples)
+    dataset = _limit_dataset(dataset, args.max_samples, args.sample_seed)
 
     warmup_prompt = tokenizer.encode("Hi")
     list(stream_generate_baseline(model, tokenizer, warmup_prompt, 3, sampler=sampler))
-    list(stream_generate(model, draft, tokenizer, warmup_prompt, block_size, 3, sampler=sampler))
+    list(stream_generate(
+        model,
+        draft,
+        tokenizer,
+        warmup_prompt,
+        block_size,
+        3,
+        sampler=sampler,
+        profile=args.profile,
+    ))
 
     responses = []
+    equivalence_failures = []
     for idx in tqdm(range(len(dataset))):
         instance = dataset[idx]
         messages = []
-        for user_content in instance["turns"]:
+        for turn_idx, user_content in enumerate(instance["turns"]):
             messages.append({"role": "user", "content": user_content})
             prompt = _apply_chat_template(tokenizer, messages, args.enable_thinking)
 
             response = {}
 
             tokens_bl, tps_bl = [], 0
+            baseline_start = time.perf_counter()
+            if args.profile:
+                mx.synchronize()
+                baseline_start = time.perf_counter()
             for r in stream_generate_baseline(model, tokenizer, prompt, args.max_new_tokens, sampler=sampler):
                 tokens_bl.append(r.token)
                 tps_bl = r.generation_tps
-            response[1] = _make_decode_metrics(len(tokens_bl), tps_bl, [1])
+            baseline_profile = None
+            if args.profile:
+                mx.synchronize()
+                baseline_profile = {"baseline_s": time.perf_counter() - baseline_start}
+            response[1] = _make_decode_metrics(len(tokens_bl), tps_bl, [1], baseline_profile)
 
-            tokens_df, accs, tps_df = [], [], 0
-            for r in stream_generate(model, draft, tokenizer, prompt, block_size, args.max_new_tokens, sampler=sampler):
-                tokens_df.extend(r.tokens)
-                accs.append(r.accepted)
+            tokens_df, accs, tps_df, profiles = [], [], 0, []
+            for r in stream_generate(
+                model,
+                draft,
+                tokenizer,
+                prompt,
+                block_size,
+                args.max_new_tokens,
+                sampler=sampler,
+                profile=args.profile,
+            ):
+                if r.tokens:
+                    tokens_df.extend(r.tokens)
+                    accs.append(r.accepted)
+                if r.profile:
+                    profiles.append(r.profile)
                 tps_df = r.generation_tps
-            response[block_size] = _make_decode_metrics(len(tokens_df), tps_df, accs)
+            response[block_size] = _make_decode_metrics(
+                len(tokens_df),
+                tps_df,
+                accs,
+                _sum_profiles(profiles) if profiles else None,
+            )
+
+            if args.check_equivalence:
+                mismatch = _first_mismatch(tokens_bl, tokens_df)
+                if mismatch is not None:
+                    prompt_hash = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
+                    equivalence_failures.append({
+                        "sample": idx,
+                        "turn": turn_idx,
+                        "index": mismatch,
+                        "prompt_sha1": prompt_hash,
+                        "prompt_chars": len(prompt),
+                        "prompt_preview": user_content[:160].replace("\n", "\\n"),
+                        "baseline_token": tokens_bl[mismatch] if mismatch < len(tokens_bl) else None,
+                        "dflash_token": tokens_df[mismatch] if mismatch < len(tokens_df) else None,
+                        "baseline_window": _token_window(tokens_bl, mismatch),
+                        "dflash_window": _token_window(tokens_df, mismatch),
+                        "baseline_len": len(tokens_bl),
+                        "dflash_len": len(tokens_df),
+                    })
 
             output_text = tokenizer.decode(tokens_df)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
 
     _print_decode_summary(responses, block_size)
+    if args.check_equivalence:
+        checked = sum(len(item["turns"]) for item in dataset)
+        if equivalence_failures:
+            print(f"Equivalence check: FAILED ({len(equivalence_failures)}/{checked} turns)")
+            for failure in equivalence_failures[:5]:
+                print(f"  {failure}")
+            raise AssertionError("DFlash output diverged from target-only greedy output")
+        print(f"Equivalence check: passed ({checked} turns)")
 
 
 def _run_server(args: argparse.Namespace) -> None:
@@ -488,6 +620,12 @@ def main() -> None:
     parser.add_argument("--draft-model", type=str, default=None)
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=DEFAULT_SAMPLE_SEED,
+        help="Seed for deterministic benchmark sample selection",
+    )
 
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:30000")
     parser.add_argument("--num-prompts", type=int, default=1024)
@@ -496,7 +634,8 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--timeout-s", type=int, default=3600)
-
+    parser.add_argument("--profile", action="store_true", help="Enable synchronized MLX DFlash profiling")
+    parser.add_argument("--check-equivalence", action="store_true", help="Assert MLX DFlash matches target-only greedy output")
     args = parser.parse_args()
 
     assert not (args.enable_thinking and any(x in args.model.lower() for x in ["qwen3-4b", "qwen3-8b"])), (
