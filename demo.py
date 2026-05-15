@@ -10,8 +10,6 @@ from typing import Any
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.5-4B-DFlash"
-ANSI_DIM = "\033[2m"
-ANSI_RESET = "\033[0m"
 THINKING_START_TAGS = ("<think>", "<thinking>")
 THINKING_END_TAGS = ("</think>", "</thinking>")
 STOP_TEXT_MARKERS = ("<|im_end|>", "<|endoftext|>", "</s>")
@@ -47,8 +45,137 @@ class RunStats:
         return self.tokens / self.elapsed_s
 
 
+class TerminalUI:
+    def __init__(self) -> None:
+        try:
+            from rich.console import Console
+            from rich.table import Table
+        except ImportError:
+            self.rich = False
+            self.out = None
+            self.table_cls = None
+            return
+
+        self.rich = True
+        self.out = Console()
+        self.table_cls = Table
+
+    def header(self, *, args: argparse.Namespace, run_dflash: bool) -> None:
+        stream_path = "dflash" if args.dflash else "target-only"
+        compare_path = "off"
+        if not args.no_compare:
+            compare_path = "target-only" if args.dflash else "dflash"
+
+        rows = [
+            ("target", args.model),
+            ("draft", args.draft_model if run_dflash else "not loaded"),
+            ("stream", stream_path),
+            ("compare", compare_path),
+            ("tokens", str(args.max_tokens)),
+            ("block", str(args.block_size)),
+            ("temp", f"{args.temperature:g}"),
+        ]
+        if not self.rich:
+            print("DFlash prompt demo")
+            for key, value in rows:
+                print(f"  {key:<8} {value}")
+            sys.stdout.flush()
+            return
+
+        self.out.print("[magenta]DFlash[/magenta] prompt demo")
+        grid = self.table_cls.grid(padding=(0, 2))
+        grid.add_column(style="dim", no_wrap=True)
+        grid.add_column()
+        for key, value in rows:
+            grid.add_row(key, value)
+        self.out.print(grid)
+        self.out.file.flush()
+
+    def status(self, label: str, detail: str | None = None) -> None:
+        if not self.rich:
+            suffix = f": {detail}" if detail else ""
+            print(f"* {label}{suffix}", flush=True)
+            return
+        self.out.print("* ", end="", style="cyan")
+        self.out.print(label, end="")
+        if detail:
+            self.out.print(f" {detail}", style="dim")
+        else:
+            self.out.print()
+
+    def section(self, title: str, detail: str | None = None) -> None:
+        if not self.rich:
+            suffix = f" {detail}" if detail else ""
+            print(f"\n[{title}]{suffix}")
+            return
+        self.out.print()
+        self.out.print("> ", end="", style="magenta")
+        self.out.print(title, end="")
+        if detail:
+            self.out.print(f"  {detail}", style="dim")
+        else:
+            self.out.print()
+
+    def stream(self, text: str, *, style: str | None = None) -> None:
+        if not text:
+            return
+        if not self.rich:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            return
+        self.out.print(text, end="", style=style, markup=False, highlight=False)
+
+    def stats(self, target: RunStats | None, dflash: RunStats | None, *, block_size: int, exact_match: bool) -> None:
+        self.section("stats")
+        if not self.rich:
+            _print_plain_stats(target, dflash, block_size=block_size, exact_match=exact_match)
+            return
+
+        table = self.table_cls(show_header=True, box=None, padding=(0, 2))
+        table.add_column("path", style="dim")
+        table.add_column("tokens", justify="right")
+        table.add_column("time", justify="right")
+        table.add_column("tok/s", justify="right")
+        table.add_column("peak", justify="right")
+        for stats in [target, dflash]:
+            if stats is None:
+                continue
+            table.add_row(
+                stats.name,
+                str(stats.tokens),
+                f"{stats.elapsed_s:.3f}s",
+                f"{stats.measured_tps:.2f}",
+                f"{stats.peak_memory_gb:.2f} GB",
+            )
+        self.out.print(table)
+
+        if target is not None and dflash is not None:
+            speedup = dflash.measured_tps / max(target.measured_tps, 1e-9)
+            speed_style = "green" if speedup >= 1.0 else "red"
+            self.out.print("speedup   ", end="", style="dim")
+            self.out.print(f"{speedup:.2f}x", style=speed_style)
+            self.out.print("same text ", end="", style="dim")
+            self.out.print("yes" if exact_match else "no", style="green" if exact_match else "red")
+
+        if dflash is not None and dflash.acceptance_lengths:
+            accepted = dflash.acceptance_lengths
+            avg_accept = sum(accepted) / len(accepted)
+            full_blocks = sum(1 for value in accepted if value >= block_size)
+            self.out.print("avg accept ", end="", style="dim")
+            self.out.print(f"{avg_accept:.2f} tokens/block")
+            self.out.print("full block ", end="", style="dim")
+            self.out.print(f"{full_blocks / len(accepted) * 100:.1f}%")
+
+
 class StreamPrinter:
-    def __init__(self, *, thinking_style: str, stop_markers: tuple[str, ...] = STOP_TEXT_MARKERS) -> None:
+    def __init__(
+        self,
+        *,
+        ui: TerminalUI,
+        thinking_style: str,
+        stop_markers: tuple[str, ...] = STOP_TEXT_MARKERS,
+    ) -> None:
+        self.ui = ui
         self.thinking_style = thinking_style
         self.stop_markers = stop_markers
         self.mode = "plain" if thinking_style == "plain" else "pending"
@@ -56,7 +183,6 @@ class StreamPrinter:
         self.stop_buffer = ""
         self.stop_hold = max((len(marker) for marker in stop_markers), default=1) - 1
         self.stopped = False
-        self.dim_open = False
         self.plain_thinking = False
 
     def write(self, text: str) -> bool:
@@ -91,9 +217,6 @@ class StreamPrinter:
         if self.mode == "pending" and self.buffer:
             self._write(self.buffer)
             self.buffer = ""
-        if self.dim_open:
-            self._write(ANSI_RESET)
-            self.dim_open = False
 
     def _write_content(self, text: str) -> None:
         if self.mode == "plain":
@@ -139,12 +262,12 @@ class StreamPrinter:
     def _start_thinking(self, *, plain: bool) -> None:
         self.mode = "thinking"
         self.plain_thinking = plain
-        self._write("\n[thinking]\n")
-        if self.thinking_style == "dim":
-            self._write(ANSI_DIM)
-            self.dim_open = True
-        elif self.thinking_style == "hide":
-            self._write("(hidden)\n")
+        detail = None
+        if self.thinking_style == "hide":
+            detail = "hidden"
+        elif self.thinking_style == "dim":
+            detail = "dimmed"
+        self.ui.section("thinking", detail)
 
     def _write_thinking(self, text: str) -> None:
         lower = text.lower()
@@ -171,11 +294,8 @@ class StreamPrinter:
         self._write(text)
 
     def _end_thinking(self) -> None:
-        if self.dim_open:
-            self._write(ANSI_RESET)
-            self.dim_open = False
         self.mode = "answer"
-        self._write("\n\n[answer]\n")
+        self.ui.section("answer")
 
     @staticmethod
     def _find_any(text: str, markers: tuple[str, ...]) -> tuple[str, int] | None:
@@ -186,10 +306,9 @@ class StreamPrinter:
                 found = (marker, idx)
         return found
 
-    @staticmethod
-    def _write(text: str) -> None:
-        sys.stdout.write(text)
-        sys.stdout.flush()
+    def _write(self, text: str) -> None:
+        style = "dim" if self.mode == "thinking" and self.thinking_style == "dim" else None
+        self.ui.stream(text, style=style)
 
 
 def _load_runtime() -> SimpleNamespace:
@@ -243,14 +362,15 @@ def _run_target(
     tokenizer: Any,
     prompt: str,
     *,
+    ui: TerminalUI,
     max_tokens: int,
     sampler: Any,
     stream: bool,
     thinking_style: str,
 ) -> RunStats:
-    printer = StreamPrinter(thinking_style=thinking_style)
+    printer = StreamPrinter(ui=ui, thinking_style=thinking_style)
     if stream:
-        print("\n[target-only]\n", flush=True)
+        ui.section("target-only")
 
     text_parts: list[str] = []
     tokens = 0
@@ -285,7 +405,7 @@ def _run_target(
 
     if stream:
         printer.close()
-        print("\n", flush=True)
+        print(flush=True)
 
     return RunStats(
         name="target-only",
@@ -305,15 +425,16 @@ def _run_dflash(
     tokenizer: Any,
     prompt: str,
     *,
+    ui: TerminalUI,
     block_size: int,
     max_tokens: int,
     sampler: Any,
     stream: bool,
     thinking_style: str,
 ) -> RunStats:
-    printer = StreamPrinter(thinking_style=thinking_style)
+    printer = StreamPrinter(ui=ui, thinking_style=thinking_style)
     if stream:
-        print("\n[dflash]\n", flush=True)
+        ui.section("dflash")
 
     text_parts: list[str] = []
     tokens = 0
@@ -357,7 +478,7 @@ def _run_dflash(
 
     if stream:
         printer.close()
-        print("\n", flush=True)
+        print(flush=True)
 
     return RunStats(
         name="dflash",
@@ -404,9 +525,7 @@ def _warmup(
     runtime.mx.synchronize()
 
 
-def _print_stats(target: RunStats | None, dflash: RunStats | None, *, block_size: int, exact_match: bool) -> None:
-    print("Stats")
-    print("-----")
+def _print_plain_stats(target: RunStats | None, dflash: RunStats | None, *, block_size: int, exact_match: bool) -> None:
     for stats in [target, dflash]:
         if stats is None:
             continue
@@ -455,15 +574,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    ui = TerminalUI()
     runtime = _load_runtime()
     run_target = (not args.dflash) or (not args.no_compare)
     run_dflash = args.dflash or (not args.no_compare)
 
-    print(f"Loading target: {args.model}", file=sys.stderr)
+    ui.header(args=args, run_dflash=run_dflash)
+    ui.status("Loading target", args.model)
     model, tokenizer = runtime.load(args.model)
     draft = None
     if run_dflash:
-        print(f"Loading draft:  {args.draft_model}", file=sys.stderr)
+        ui.status("Loading draft", args.draft_model)
         draft = runtime.load_draft(args.draft_model)
 
     sampler = runtime.make_sampler(temp=args.temperature)
@@ -474,6 +595,8 @@ def main() -> None:
         raw_prompt=args.raw_prompt,
     )
 
+    if args.warmup_tokens > 0:
+        ui.status("Warming up", f"{args.warmup_tokens} tokens per path")
     _warmup(
         runtime,
         model,
@@ -498,6 +621,7 @@ def main() -> None:
             draft,
             tokenizer,
             prompt,
+            ui=ui,
             block_size=args.block_size,
             max_tokens=args.max_tokens,
             sampler=sampler,
@@ -505,12 +629,13 @@ def main() -> None:
             thinking_style=args.thinking_style,
         )
         if not args.no_compare:
-            print("Running target-only comparison...", file=sys.stderr)
+            ui.status("Comparing", "target-only")
             target_stats = _run_target(
                 runtime,
                 model,
                 tokenizer,
                 prompt,
+                ui=ui,
                 max_tokens=args.max_tokens,
                 sampler=sampler,
                 stream=False,
@@ -522,13 +647,14 @@ def main() -> None:
             model,
             tokenizer,
             prompt,
+            ui=ui,
             max_tokens=args.max_tokens,
             sampler=sampler,
             stream=True,
             thinking_style=args.thinking_style,
         )
         if not args.no_compare:
-            print("Running DFlash comparison...", file=sys.stderr)
+            ui.status("Comparing", "dflash")
             if draft is None:
                 raise ValueError("DFlash comparison requires a loaded draft model")
             dflash_stats = _run_dflash(
@@ -537,6 +663,7 @@ def main() -> None:
                 draft,
                 tokenizer,
                 prompt,
+                ui=ui,
                 block_size=args.block_size,
                 max_tokens=args.max_tokens,
                 sampler=sampler,
@@ -545,7 +672,7 @@ def main() -> None:
             )
 
     exact_match = bool(target_stats and dflash_stats and target_stats.text == dflash_stats.text)
-    _print_stats(target_stats, dflash_stats, block_size=args.block_size, exact_match=exact_match)
+    ui.stats(target_stats, dflash_stats, block_size=args.block_size, exact_match=exact_match)
 
 
 if __name__ == "__main__":
