@@ -14,6 +14,7 @@ ANSI_DIM = "\033[2m"
 ANSI_RESET = "\033[0m"
 THINKING_START_TAGS = ("<think>", "<thinking>")
 THINKING_END_TAGS = ("</think>", "</thinking>")
+STOP_TEXT_MARKERS = ("<|im_end|>", "<|endoftext|>", "</s>")
 PLAIN_THINKING_PREFIXES = (
     "here's a thinking process",
     "here is a thinking process",
@@ -47,16 +48,54 @@ class RunStats:
 
 
 class StreamPrinter:
-    def __init__(self, *, thinking_style: str) -> None:
+    def __init__(self, *, thinking_style: str, stop_markers: tuple[str, ...] = STOP_TEXT_MARKERS) -> None:
         self.thinking_style = thinking_style
+        self.stop_markers = stop_markers
         self.mode = "plain" if thinking_style == "plain" else "pending"
         self.buffer = ""
+        self.stop_buffer = ""
+        self.stop_hold = max((len(marker) for marker in stop_markers), default=1) - 1
+        self.stopped = False
         self.dim_open = False
         self.plain_thinking = False
 
-    def write(self, text: str) -> None:
+    def write(self, text: str) -> bool:
         if not text:
-            return
+            return True
+        if self.stopped:
+            return False
+
+        text = self.stop_buffer + text
+        marker_match = self._find_any(text, self.stop_markers)
+        if marker_match is not None:
+            _, idx = marker_match
+            self.stop_buffer = ""
+            self.stopped = True
+            self._write_content(text[:idx])
+            return False
+
+        if self.stop_hold > 0 and len(text) > self.stop_hold:
+            safe_text = text[:-self.stop_hold]
+            self.stop_buffer = text[-self.stop_hold:]
+        else:
+            safe_text = ""
+            self.stop_buffer = text
+
+        self._write_content(safe_text)
+        return True
+
+    def close(self) -> None:
+        if not self.stopped and self.stop_buffer:
+            self._write_content(self.stop_buffer)
+            self.stop_buffer = ""
+        if self.mode == "pending" and self.buffer:
+            self._write(self.buffer)
+            self.buffer = ""
+        if self.dim_open:
+            self._write(ANSI_RESET)
+            self.dim_open = False
+
+    def _write_content(self, text: str) -> None:
         if self.mode == "plain":
             self._write(text)
             return
@@ -67,14 +106,6 @@ class StreamPrinter:
             self._write_pending(text)
             return
         self._write_thinking(text)
-
-    def close(self) -> None:
-        if self.mode == "pending" and self.buffer:
-            self._write(self.buffer)
-            self.buffer = ""
-        if self.dim_open:
-            self._write(ANSI_RESET)
-            self.dim_open = False
 
     def _write_pending(self, text: str) -> None:
         self.buffer += text
@@ -178,6 +209,14 @@ def _load_runtime() -> SimpleNamespace:
     )
 
 
+def _strip_stop_text(text: str, stop_markers: tuple[str, ...] = STOP_TEXT_MARKERS) -> str:
+    found = StreamPrinter._find_any(text, stop_markers)
+    if found is None:
+        return text
+    _, idx = found
+    return text[:idx]
+
+
 def _make_prompt(tokenizer: Any, user_prompt: str, *, enable_thinking: bool, raw_prompt: bool) -> str:
     if raw_prompt:
         return user_prompt
@@ -229,11 +268,18 @@ def _run_target(
     ):
         segment = getattr(response, "text", "")
         if stream and segment:
-            printer.write(segment)
+            if not printer.write(segment):
+                text_parts.append(segment)
+                tokens += 1
+                last_tps = float(getattr(response, "generation_tps", 0.0) or 0.0)
+                peak_memory = max(peak_memory, float(getattr(response, "peak_memory", 0.0) or 0.0))
+                break
         text_parts.append(segment)
         tokens += 1
         last_tps = float(getattr(response, "generation_tps", 0.0) or 0.0)
         peak_memory = max(peak_memory, float(getattr(response, "peak_memory", 0.0) or 0.0))
+        if not stream and _strip_stop_text("".join(text_parts)) != "".join(text_parts):
+            break
     runtime.mx.synchronize()
     elapsed = time.perf_counter() - start
 
@@ -243,7 +289,7 @@ def _run_target(
 
     return RunStats(
         name="target-only",
-        text="".join(text_parts),
+        text=_strip_stop_text("".join(text_parts)),
         tokens=tokens,
         elapsed_s=elapsed,
         generation_tps=last_tps,
@@ -288,7 +334,15 @@ def _run_dflash(
     ):
         segment = response.text
         if stream and segment:
-            printer.write(segment)
+            if not printer.write(segment):
+                text_parts.append(segment)
+                emitted = len(response.tokens)
+                tokens += emitted
+                if emitted:
+                    acceptance_lengths.append(response.accepted)
+                last_tps = float(response.generation_tps)
+                peak_memory = max(peak_memory, float(response.peak_memory))
+                break
         text_parts.append(segment)
         emitted = len(response.tokens)
         tokens += emitted
@@ -296,6 +350,8 @@ def _run_dflash(
             acceptance_lengths.append(response.accepted)
         last_tps = float(response.generation_tps)
         peak_memory = max(peak_memory, float(response.peak_memory))
+        if not stream and _strip_stop_text("".join(text_parts)) != "".join(text_parts):
+            break
     runtime.mx.synchronize()
     elapsed = time.perf_counter() - start
 
@@ -305,7 +361,7 @@ def _run_dflash(
 
     return RunStats(
         name="dflash",
-        text="".join(text_parts),
+        text=_strip_stop_text("".join(text_parts)),
         tokens=tokens,
         elapsed_s=elapsed,
         generation_tps=last_tps,
