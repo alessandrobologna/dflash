@@ -10,6 +10,23 @@ from typing import Any
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.5-4B-DFlash"
+ANSI_DIM = "\033[2m"
+ANSI_RESET = "\033[0m"
+THINKING_START_TAGS = ("<think>", "<thinking>")
+THINKING_END_TAGS = ("</think>", "</thinking>")
+PLAIN_THINKING_PREFIXES = (
+    "here's a thinking process",
+    "here is a thinking process",
+    "thinking process:",
+    "let's think",
+)
+PLAIN_FINAL_MARKERS = (
+    "\nfinal answer:",
+    "\nfinal:",
+    "\nanswer:",
+    "\nstory:",
+    "\nthe story:",
+)
 
 
 @dataclass
@@ -27,6 +44,121 @@ class RunStats:
         if self.elapsed_s <= 0:
             return 0.0
         return self.tokens / self.elapsed_s
+
+
+class StreamPrinter:
+    def __init__(self, *, thinking_style: str) -> None:
+        self.thinking_style = thinking_style
+        self.mode = "plain" if thinking_style == "plain" else "pending"
+        self.buffer = ""
+        self.dim_open = False
+        self.plain_thinking = False
+
+    def write(self, text: str) -> None:
+        if not text:
+            return
+        if self.mode == "plain":
+            self._write(text)
+            return
+        if self.mode == "answer":
+            self._write(text)
+            return
+        if self.mode == "pending":
+            self._write_pending(text)
+            return
+        self._write_thinking(text)
+
+    def close(self) -> None:
+        if self.mode == "pending" and self.buffer:
+            self._write(self.buffer)
+            self.buffer = ""
+        if self.dim_open:
+            self._write(ANSI_RESET)
+            self.dim_open = False
+
+    def _write_pending(self, text: str) -> None:
+        self.buffer += text
+
+        start = self._find_any(self.buffer.lower(), THINKING_START_TAGS)
+        if start is not None:
+            marker, idx = start
+            before = self.buffer[:idx]
+            after = self.buffer[idx + len(marker):]
+            self.buffer = ""
+            if before:
+                self._write(before)
+            self._start_thinking(plain=False)
+            self._write_thinking(after)
+            return
+
+        stripped = self.buffer.lstrip().lower()
+        if any(stripped.startswith(prefix) for prefix in PLAIN_THINKING_PREFIXES):
+            buffered = self.buffer
+            self.buffer = ""
+            self._start_thinking(plain=True)
+            self._write_thinking(buffered)
+            return
+
+        if len(self.buffer) >= 240:
+            buffered = self.buffer
+            self.buffer = ""
+            self.mode = "answer"
+            self._write(buffered)
+
+    def _start_thinking(self, *, plain: bool) -> None:
+        self.mode = "thinking"
+        self.plain_thinking = plain
+        self._write("\n[thinking]\n")
+        if self.thinking_style == "dim":
+            self._write(ANSI_DIM)
+            self.dim_open = True
+        elif self.thinking_style == "hide":
+            self._write("(hidden)\n")
+
+    def _write_thinking(self, text: str) -> None:
+        lower = text.lower()
+        end = self._find_any(lower, THINKING_END_TAGS)
+        if end is None and self.plain_thinking:
+            end = self._find_any(lower, PLAIN_FINAL_MARKERS)
+
+        if end is None:
+            self._write_visible_thinking(text)
+            return
+
+        marker, idx = end
+        before = text[:idx]
+        after_start = idx + len(marker)
+        after = text[after_start:] if marker in THINKING_END_TAGS else text[idx:]
+        self._write_visible_thinking(before)
+        self._end_thinking()
+        if after:
+            self._write(after)
+
+    def _write_visible_thinking(self, text: str) -> None:
+        if self.thinking_style == "hide":
+            return
+        self._write(text)
+
+    def _end_thinking(self) -> None:
+        if self.dim_open:
+            self._write(ANSI_RESET)
+            self.dim_open = False
+        self.mode = "answer"
+        self._write("\n\n[answer]\n")
+
+    @staticmethod
+    def _find_any(text: str, markers: tuple[str, ...]) -> tuple[str, int] | None:
+        found: tuple[str, int] | None = None
+        for marker in markers:
+            idx = text.find(marker)
+            if idx >= 0 and (found is None or idx < found[1]):
+                found = (marker, idx)
+        return found
+
+    @staticmethod
+    def _write(text: str) -> None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
 
 
 def _load_runtime() -> SimpleNamespace:
@@ -75,7 +207,9 @@ def _run_target(
     max_tokens: int,
     sampler: Any,
     stream: bool,
+    thinking_style: str,
 ) -> RunStats:
+    printer = StreamPrinter(thinking_style=thinking_style)
     if stream:
         print("\n[target-only]\n", flush=True)
 
@@ -95,7 +229,7 @@ def _run_target(
     ):
         segment = getattr(response, "text", "")
         if stream and segment:
-            print(segment, end="", flush=True)
+            printer.write(segment)
         text_parts.append(segment)
         tokens += 1
         last_tps = float(getattr(response, "generation_tps", 0.0) or 0.0)
@@ -104,6 +238,7 @@ def _run_target(
     elapsed = time.perf_counter() - start
 
     if stream:
+        printer.close()
         print("\n", flush=True)
 
     return RunStats(
@@ -128,7 +263,9 @@ def _run_dflash(
     max_tokens: int,
     sampler: Any,
     stream: bool,
+    thinking_style: str,
 ) -> RunStats:
+    printer = StreamPrinter(thinking_style=thinking_style)
     if stream:
         print("\n[dflash]\n", flush=True)
 
@@ -151,7 +288,7 @@ def _run_dflash(
     ):
         segment = response.text
         if stream and segment:
-            print(segment, end="", flush=True)
+            printer.write(segment)
         text_parts.append(segment)
         emitted = len(response.tokens)
         tokens += emitted
@@ -163,6 +300,7 @@ def _run_dflash(
     elapsed = time.perf_counter() - start
 
     if stream:
+        printer.close()
         print("\n", flush=True)
 
     return RunStats(
@@ -249,6 +387,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-prompt", action="store_true", help="Use --prompt directly without chat template")
     parser.add_argument("--dflash", action="store_true", help="Stream the DFlash run instead of the target-only run")
     parser.add_argument("--no-compare", action="store_true", help="Only run the streamed path; omit speedup comparison")
+    parser.add_argument(
+        "--thinking-style",
+        choices=["dim", "plain", "hide"],
+        default="dim",
+        help="How to display detected thinking text while streaming",
+    )
     parser.add_argument("--warmup-tokens", type=int, default=3, help="Warmup tokens per path before measuring")
     return parser.parse_args()
 
@@ -302,6 +446,7 @@ def main() -> None:
             max_tokens=args.max_tokens,
             sampler=sampler,
             stream=True,
+            thinking_style=args.thinking_style,
         )
         if not args.no_compare:
             print("Running target-only comparison...", file=sys.stderr)
@@ -313,6 +458,7 @@ def main() -> None:
                 max_tokens=args.max_tokens,
                 sampler=sampler,
                 stream=False,
+                thinking_style="plain",
             )
     else:
         target_stats = _run_target(
@@ -323,6 +469,7 @@ def main() -> None:
             max_tokens=args.max_tokens,
             sampler=sampler,
             stream=True,
+            thinking_style=args.thinking_style,
         )
         if not args.no_compare:
             print("Running DFlash comparison...", file=sys.stderr)
@@ -338,6 +485,7 @@ def main() -> None:
                 max_tokens=args.max_tokens,
                 sampler=sampler,
                 stream=False,
+                thinking_style="plain",
             )
 
     exact_match = bool(target_stats and dflash_stats and target_stats.text == dflash_stats.text)
