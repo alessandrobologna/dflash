@@ -397,6 +397,15 @@
       line-height: 1.34;
     }
 
+    pre.command-block {
+      max-height: none;
+      padding: clamp(22px, 3vw, 36px);
+      font-size: clamp(18px, 2.2vw, 32px);
+      line-height: 1.42;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
     .hl {
       color: var(--teal);
     }
@@ -1100,9 +1109,23 @@ commit.cache.advance(accepted_count)</code></pre>
         <span class="tag">2.06x quality-gated speedup</span>
       </div>
     </section>
+
+    <section class="slide compact-title" data-kicker="Demo">
+      <h2>Run the live prompt demo.</h2>
+      <div class="panel wide">
+        <div class="code-title">
+          <span>studio.local</span>
+          <span>DFlash stream + target comparison</span>
+        </div>
+<pre class="command-block"><code>python demo.py \
+  --prompt "write a python function to invert a tree" \
+  --dflash \
+  --max-tokens 4096</code></pre>
+      </div>
+    </section>
   </main>
 
-  <div class="slide-number" id="slideNumber">1 / 14</div>
+  <div class="slide-number" id="slideNumber">1 / 15</div>
   <div class="controls" aria-label="Slide controls">
     <button type="button" id="prev" title="Previous slide" aria-label="Previous slide">&lt;</button>
     <button type="button" id="next" title="Next slide" aria-label="Next slide">&gt;</button>
